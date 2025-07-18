@@ -1,0 +1,388 @@
+import torch
+import torch.nn as nn
+from torchvision.utils import save_image, make_grid
+from torchvision import transforms
+from torch.utils.data import DataLoader
+from dataloader import train_dataloader, test_dataloader
+from tqdm import tqdm
+import os
+from models import ContextUnet
+from utils import SpriteDataset, generate_animation
+import json
+import wandb
+from evaluator import evaluation_model
+import numpy as np
+import math
+
+
+
+
+class DiffusionModel(nn.Module):
+    def __init__(self, device=None, checkpoint_name=None, mode="train", noise_type="linear"):
+        super(DiffusionModel, self).__init__()
+        self.device = self.initialize_device(device)
+        self.file_dir = os.path.dirname(__file__)
+        self.initialize_dataset_name(self.file_dir, checkpoint_name)
+        self.checkpoint_name = checkpoint_name
+        self.nn_model = self.initialize_nn_model(checkpoint_name, self.file_dir, self.device)
+        self.create_dirs(self.file_dir)
+        self.mode = mode
+        self.noise_type = noise_type
+
+    def train(self, batch_size=64, n_epoch=32, lr=1e-3, timesteps=500, beta1=1e-4, beta2=0.02,
+              checkpoint_save_dir=None, image_save_dir=None):
+        """Trains model for given inputs"""
+        self.nn_model.train()        
+        _ , _, ab_t = self.get_ddpm_noise_schedule(timesteps, beta1, beta2, self.device)
+        dataset = self.instantiate_dataset()
+        dataloader = self.initialize_dataloader(dataset, batch_size, self.checkpoint_name, self.file_dir)
+        optim = self.initialize_optimizer(self.nn_model, lr, self.checkpoint_name, self.file_dir, self.device)
+        scheduler = self.initialize_scheduler(optim, self.checkpoint_name, self.file_dir, self.device)
+
+        for epoch in range(self.get_start_epoch(self.checkpoint_name, self.file_dir), 
+                           self.get_start_epoch(self.checkpoint_name, self.file_dir) + n_epoch):
+            ave_loss = 0
+
+            print(dataloader)
+            for x, c in tqdm(dataloader, mininterval=2, desc=f"Epoch {epoch}"):
+                x = x.to(self.device)
+                c = self.get_masked_context(c).to(self.device)
+                
+                # perturb data
+                noise = torch.randn_like(x)
+                t = torch.randint(1, timesteps + 1, (x.shape[0], )).to(self.device)
+                x_pert = self.perturb_input(x, t, noise, ab_t)
+
+                # predict noise
+                pred_noise = self.nn_model(x_pert, t / timesteps, c=c)
+
+                # obtain loss
+                loss = torch.nn.functional.mse_loss(pred_noise, noise)
+                wandb.log({"Loss": loss,})
+                # update params
+                optim.zero_grad()
+                loss.backward()
+                optim.step()
+
+                ave_loss += loss.item()/len(dataloader)
+            scheduler.step()
+            wandb.log({"Epoch": epoch,})
+            print(f"Epoch: {epoch}, loss: {ave_loss}")
+            self.save_tensor_images(x, x_pert, self.get_x_unpert(x_pert, t, pred_noise, ab_t), 
+                                    epoch, self.file_dir, image_save_dir)
+            self.save_checkpoint(self.nn_model, optim, scheduler, epoch, ave_loss, 
+                                 timesteps, beta1, beta2, self.device,
+                                 dataloader.batch_size, self.file_dir, checkpoint_save_dir)
+            
+
+
+    def test(self, batch_size=64, timesteps=500, beta1=1e-4, beta2=0.02):
+        """Trains model for given inputs"""      
+        _ , _, ab_t = self.get_ddpm_noise_schedule(timesteps, beta1, beta2, self.device)
+        dataset = self.instantiate_dataset()
+        dataloader = self.initialize_dataloader(dataset, batch_size, self.checkpoint_name, self.file_dir)
+        normalize = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        evaluator = evaluation_model()
+
+        generated_images=[]
+        accuracy_array = []
+
+        for c, label_name in tqdm(dataloader, mininterval=2):
+
+            final_image, predicted_images, _ = self.sample_ddpm(n_samples=batch_size,context=c,timesteps=timesteps,beta1=beta1,beta2=beta2)
+            generated_images.append(final_image)
+            accuracy = evaluator.eval(normalize(final_image).cuda(), c.cpu())
+            print(f"Classification accuracy on one samples : ", accuracy)
+            accuracy_array.append(accuracy)
+            
+        #Display the accuracy
+        print("Accuracy : ", np.mean(np.array(accuracy_array)))
+
+        #Save the evolution timelapse
+        timelapse_comparison = [make_grid((predicted_images[i].detach())) for i in range(0,len(predicted_images), len(predicted_images)//6)]
+        timelapse_comparison.append(make_grid((final_image.detach())))
+        title = ""
+        for object in label_name:
+            title = title + object[0] + " , "
+        save_image(timelapse_comparison, "saved_images/"+title+"timelapse.png")
+
+        #Save all the images as a grid
+        save_image([make_grid((img.detach())) for img in generated_images], "saved_images/image_grid.png")
+        
+        return generated_images
+
+
+
+    @torch.no_grad()
+    def sample_ddpm(self, n_samples, context=None, timesteps=None, 
+                    beta1=None, beta2=None, save_rate=20, inference_transform=lambda x: (x+1)/2):
+        """Returns the final denoised sample x0,
+        intermediate samples xT, xT-1, ..., x1, and
+        times tT, tT-1, ..., t1
+        """
+        if all([timesteps, beta1, beta2]):
+            a_t, b_t, ab_t = self.get_ddpm_noise_schedule(timesteps, beta1, beta2, self.device)
+        else:
+            timesteps, a_t, b_t, ab_t = self.get_ddpm_params_from_checkpoint(self.file_dir,
+                                                                             self.checkpoint_name, 
+                                                                             self.device)
+        
+        self.nn_model.eval()
+        samples = torch.randn(n_samples, self.nn_model.in_channels, 
+                              self.nn_model.height, self.nn_model.width, 
+                              device=self.device)
+        intermediate_samples = [samples.detach().cpu()] # samples at T = timesteps
+        t_steps = [timesteps] # keep record of time to use in animation generation
+        for t in range(timesteps, 0, -1):
+            print(f"Sampling timestep {t}", end="\r")
+            if t % 50 == 0: print(f"Sampling timestep {t}")
+
+            z = torch.randn_like(samples) if t > 1 else 0
+            pred_noise = self.nn_model(samples, 
+                                       torch.tensor([t/timesteps], device=self.device)[:, None, None, None], 
+                                       context)
+            samples = self.denoise_add_noise(samples, t, pred_noise, a_t, b_t, ab_t, z)
+            
+            if t % save_rate == 1 or t < 8:
+                intermediate_samples.append(inference_transform(samples.detach().cpu()))
+                t_steps.append(t-1)
+        return intermediate_samples[-1], intermediate_samples, t_steps
+
+    def perturb_input(self, x, t, noise, ab_t):
+        """Perturbs given input
+        i.e., Algorithm 1, step 5, argument of epsilon_theta in the article
+        """
+        return ab_t.sqrt()[t, None, None, None] * x + (1 - ab_t[t, None, None, None]).sqrt() * noise
+    
+    def instantiate_dataset(self):
+
+        if self.mode == "train":
+            return train_dataloader(image_dir="augmented_iclevr", annotation_path="augmented_train.json", objects_path="objects.json")
+        if self.mode == "test":
+            return test_dataloader(annotation_path="test.json", objects_path="objects.json")
+
+    def get_transforms(self):
+        """Returns transform and target-transform"""
+        transform = transforms.Compose([
+                transforms.ToTensor(),
+                lambda x: 2*(x - 0.5)
+            ])
+        target_transform = transforms.Compose([
+                lambda x: torch.tensor([x]),
+                lambda class_labels, n_classes=10: nn.functional.one_hot(class_labels, n_classes).squeeze()
+            ])
+        return transform, target_transform
+    
+    def get_x_unpert(self, x_pert, t, pred_noise, ab_t):
+        """Removes predicted noise pred_noise from perturbed image x_pert"""
+        return (x_pert - (1 - ab_t[t, None, None, None]).sqrt() * pred_noise) / ab_t.sqrt()[t, None, None, None]
+    
+    def initialize_nn_model(self, checkpoint_name, file_dir, device):
+        """Returns the instantiated model based on dataset name"""
+
+        nn_model = ContextUnet(in_channels=3, height=64, width=64, n_feat=64, n_cfeat=24, n_downs=4)
+
+        if checkpoint_name:
+            checkpoint = torch.load(os.path.join(file_dir, "checkpoints", checkpoint_name), map_location=device)
+            nn_model.to(device)
+            nn_model.load_state_dict(checkpoint["model_state_dict"])
+            return nn_model
+        return nn_model.to(device)
+
+    def save_checkpoint(self, model, optimizer, scheduler, epoch, loss, 
+                        timesteps, beta1, beta2, device, batch_size, 
+                        file_dir, save_dir):
+        """Saves checkpoint for given variables"""
+        if save_dir is None:
+            fpath = os.path.join(file_dir, "checkpoints", "_checkpoint_"+str(epoch)+".pth")
+        else:
+            fpath = os.path.join(save_dir, "_checkpoint_"+str(epoch)+".pth")
+
+        checkpoint = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "loss": loss,
+            "timesteps": timesteps, 
+            "beta1": beta1, 
+            "beta2": beta2,
+            "device": device,
+            "batch_size": batch_size
+        }
+        torch.save(checkpoint, fpath)
+
+    def create_dirs(self, file_dir):
+        """Creates directories required for training"""
+        dir_names = ["checkpoints", "saved_images"]
+        for dir_name in dir_names:
+            os.makedirs(os.path.join(file_dir, dir_name), exist_ok=True)
+
+    def initialize_optimizer(self, nn_model, lr, checkpoint_name, file_dir, device):
+        """Instantiates and initializes the optimizer based on checkpoint availability"""
+        optim = torch.optim.Adam(nn_model.parameters(), lr=lr)
+        if checkpoint_name:
+            checkpoint = torch.load(os.path.join(file_dir, "checkpoints", checkpoint_name), map_location=device)
+            optim.load_state_dict(checkpoint["optimizer_state_dict"])
+        return optim
+
+    def initialize_scheduler(self, optimizer, checkpoint_name, file_dir, device):
+        """Instantiates and initializes scheduler based on checkpoint availability"""
+        scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1, 
+                                                      end_factor=0.01, total_iters=50)
+        if checkpoint_name:
+            checkpoint = torch.load(os.path.join(file_dir, "checkpoints", checkpoint_name), map_location=device)
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        return scheduler
+    
+    def get_start_epoch(self, checkpoint_name, file_dir):
+        """Returns starting epoch for training"""
+        if checkpoint_name:
+            start_epoch = torch.load(os.path.join(file_dir, "checkpoints", checkpoint_name), 
+                                    map_location=torch.device("cpu"))["epoch"] + 1
+        else:
+            start_epoch = 0
+        return start_epoch
+    
+    def save_tensor_images(self, x_orig, x_noised, x_denoised, cur_epoch, file_dir, save_dir):
+        """Saves given tensors as a single image"""
+        if save_dir is None:
+            fpath = os.path.join(file_dir, "saved_images", f"x_orig_noised_denoised_{cur_epoch}.jpeg")
+        else:
+            fpath = os.path.join(save_dir, f"x_orig_noised_denoised_{cur_epoch}.jpeg")
+        inference_transform = lambda x: (x + 1)/2
+        save_image([make_grid(inference_transform(img.detach())) for img in [x_orig, x_noised, x_denoised]], fpath)
+
+    def get_ddpm_noise_schedule(self, timesteps, beta1, beta2, device):
+        """
+        If we have a linear noise schedule then
+        Returns ddpm noise schedule variables, a_t, b_t, ab_t
+        b_t: \beta_t
+        a_t: \alpha_t
+        ab_t \bar{\alpha}_t
+        if not it is a cosine noise schedule
+        """
+        if self.noise_type == "linear":
+            b_t = torch.linspace(beta1, beta2, timesteps+1, device=device)
+            a_t = 1 - b_t
+            ab_t = torch.cumprod(a_t, dim=0)
+            return a_t, b_t, ab_t
+        elif self.noise_type == "cosine":
+    # Cosine schedule from Nichol & Dhariwal
+            steps = timesteps + 1
+            s = 0.008  # small offset for stability
+
+            x = torch.linspace(0, timesteps, steps, device=device) / timesteps
+            alphas_cumprod = torch.cos((x + s) / (1 + s) * math.pi / 2) ** 2
+            alphas_cumprod = alphas_cumprod / alphas_cumprod[0]  # Normalize so that alpha_bar[0] = 1
+
+            ab_t = alphas_cumprod
+            a_t = ab_t[1:] / ab_t[:-1]      # alpha_t = alpha_bar[t] / alpha_bar[t-1]
+            a_t = torch.cat([torch.tensor([1.0], device=device), a_t])  # First alpha_t = 1
+            b_t = 1 - a_t                   # beta_t = 1 - alpha_t
+
+            return a_t, b_t, ab_t
+
+        elif self.noise_type == "quadratic":
+            steps = timesteps + 1
+            t = torch.linspace(0, 1, steps, device=device)  # normalized time [0,1]
+            
+            ab_t = 1 - t**2  # bar_alpha_t: decays quadratically from 1 to 0
+            ab_t = torch.clamp(ab_t, min=1e-8)  # prevent numerical issues
+
+            a_t = ab_t[1:] / ab_t[:-1]        # alpha_t = bar_alpha[t] / bar_alpha[t-1]
+            a_t = torch.cat([torch.tensor([1.0], device=device), a_t])  # alpha_0 = 1
+            b_t = 1 - a_t                     # beta_t = 1 - alpha_t
+
+            return a_t, b_t, ab_t
+            
+
+    def get_ddpm_params_from_checkpoint(self, file_dir, checkpoint_name, device):
+        """Returns scheduler variables T, a_t, ab_t, and b_t from checkpoint"""
+        checkpoint = torch.load(os.path.join(file_dir, "checkpoints", checkpoint_name), torch.device("cpu"))
+        T = checkpoint["timesteps"]
+        a_t, b_t, ab_t = self.get_ddpm_noise_schedule(T, checkpoint["beta1"], checkpoint["beta2"], device)
+        return T, a_t, b_t, ab_t
+    
+    def denoise_add_noise(self, x, t, pred_noise, a_t, b_t, ab_t, z):
+        """Removes predicted noise from x and adds gaussian noise z
+        i.e., Algorithm 2, step 4 at the ddpm article
+        """
+        noise = b_t.sqrt()[t]*z
+        denoised_x = (x - pred_noise * ((1 - a_t[t]) / (1 - ab_t[t]).sqrt())) / a_t[t].sqrt()
+        return denoised_x + noise
+    
+    def initialize_dataset_name(self, file_dir, checkpoint_name):
+        """Initializes dataset name based on checkpoint availability"""
+        if checkpoint_name:
+            #return torch.load(os.path.join(file_dir, "checkpoints", checkpoint_name), 
+                                    #map_location=torch.device("cpu"))[""]
+            return torch.load(os.path.join(file_dir, "checkpoints", checkpoint_name), map_location=torch.device("cpu")) #my code
+    
+    def initialize_dataloader(self, dataset, batch_size, checkpoint_name, file_dir):
+        """Returns dataloader based on batch-size of checkpoint if present"""
+        """if checkpoint_name:
+            batch_size = torch.load(os.path.join(file_dir, "checkpoints", checkpoint_name), 
+                                    map_location=torch.device("cpu"))["batch_size"]"""
+        return DataLoader(dataset, batch_size, True)
+    
+    def get_masked_context(self, context, p=0.9):
+        "Randomly mask out context"
+        return context*torch.bernoulli(torch.ones((context.shape[0], 1))*p)
+    
+    def save_generated_samples_into_folder(self, n_samples, context, folder_path, **kwargs):
+        """Save DDPM generated inputs into a specified directory"""
+        samples, _, _ = self.sample_ddpm(n_samples, context, **kwargs)
+        for i, sample in enumerate(samples):
+            save_image(sample, os.path.join(folder_path, f"image_{i}.jpeg"))
+    
+    def save_dataset_test_images(self, n_samples):
+        """Save dataset test images with specified number"""
+        folder_path = os.path.join(self.file_dir, "-test-images")
+        os.makedirs(folder_path, exist_ok=True)
+
+        dataset = self.instantiate_dataset((transforms.ToTensor(), None), self.file_dir, train=False)
+        dataloader = DataLoader(dataset, 1, True)
+        for i, (image, _) in enumerate(dataloader):
+            if i == n_samples: break
+            save_image(image, os.path.join(folder_path, f"image_{i}.jpeg"))
+
+    def initialize_device(self, device):
+        """Initializes device based on availability"""
+        if device is None:
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
+        return torch.device(device)
+    
+    def get_custom_context(self, n_samples, n_classes, device):
+        """Returns custom context in one-hot encoded form"""
+        context = []
+        for i in range(n_classes - 1):
+            context.extend([i]*(n_samples//n_classes))
+        context.extend([n_classes - 1]*(n_samples - len(context)))
+        return torch.nn.functional.one_hot(torch.tensor(context), n_classes).float().to(device)
+    
+    def generate(self, n_samples, n_images_per_row, timesteps, beta1, beta2):
+        """Generates x0 and intermediate samples xi via DDPM, 
+        and saves as jpeg and gif files for given inputs
+        """
+        root = os.path.join(self.file_dir, "generated-images")
+        os.makedirs(root, exist_ok=True)
+        x0, intermediate_samples, t_steps = self.sample_ddpm(n_samples,
+                                                             self.get_custom_context(
+                                                                 n_samples, self.nn_model.n_cfeat, 
+                                                                 self.device),
+                                                             timesteps,
+                                                             beta1,
+                                                             beta2,)
+        save_image(x0, os.path.join(root, "_ddpm_images.jpeg"), nrow=n_images_per_row)
+        generate_animation(intermediate_samples,
+                           t_steps, 
+                           os.path.join(root, "_ani.gif"),
+                           n_images_per_row)
+
+
