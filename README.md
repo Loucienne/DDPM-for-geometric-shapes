@@ -1,3 +1,2 @@
-J'ai réalisé ce projet dans le cadre d'un cours de Deep Learning. Il a pour but de générer des images de formes gémoétriques colorées à partir d'un contexte qui spécifie ce qui doit se trouver sur chaque image. \
-Pour le réaliser j'ai finetuné un modèle déjà existant et initialement utilisé pour générer des nombres du dataset MNIST. \
-Pour plus de détails, lire le fichier pdf "DDPM-for-geometric-shapes.pdf"
+This project generate colorfull geometric shapes from a context that specifies what shapes must be on the image. To achieve this result, I finetuned an already existing model (byrkbrk/conditional-ddpm) initially used to generate numbers from the MNIST dataset. \
+For more details and results, please reade the "DDPM-for-geometric-shapes.pdf" file.
